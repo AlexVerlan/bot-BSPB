@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 # --- БАЗА ДАННЫХ ---
 def init_db():
-    """Создаёт таблицу пользователей, если её нет."""
+    """Создаёт таблицу пользователей и добавляет недостающие столбцы."""
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("""
@@ -34,9 +34,15 @@ def init_db():
             first_name TEXT,
             joined_date TEXT,
             has_accepted INTEGER DEFAULT 0,
-            accepted_date TEXT
+            accepted_date TEXT,
+            last_task_date TEXT
         )
     """)
+    # Для существующих таблиц, где ещё нет столбца last_task_date
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN last_task_date TEXT")
+    except sqlite3.OperationalError:
+        pass  # столбец уже существует
     conn.commit()
     conn.close()
     logger.info("База данных инициализирована.")
@@ -49,7 +55,6 @@ def add_user(user_id, username, first_name):
         INSERT OR IGNORE INTO users (user_id, username, first_name, joined_date)
         VALUES (?, ?, ?, ?)
     """, (user_id, username, first_name, datetime.now().strftime("%Y-%m-%d %H:%M")))
-    # Если пользователь уже был, обновим имя (на случай смены)
     cur.execute("UPDATE users SET first_name = ?, username = ? WHERE user_id = ?",
                 (first_name, username, user_id))
     conn.commit()
@@ -76,6 +81,23 @@ def is_accepted(user_id):
     conn.close()
     return row is not None and row[0] == 1
 
+def get_last_task_date(user_id):
+    """Возвращает дату последнего выданного задания (ГГГГ-ММ-ДД) или None."""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT last_task_date FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def set_last_task_date(user_id, date_str):
+    """Обновляет дату последнего задания."""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET last_task_date = ? WHERE user_id = ?", (date_str, user_id))
+    conn.commit()
+    conn.close()
+
 def get_statistics():
     """Собирает статистику для админа."""
     conn = sqlite3.connect(DB_FILE)
@@ -87,8 +109,16 @@ def get_statistics():
     today = datetime.now().strftime("%Y-%m-%d")
     cur.execute("SELECT COUNT(*) FROM users WHERE joined_date LIKE ?", (f"{today}%",))
     new_today = cur.fetchone()[0]
+    # Сколько пользователей получили задание сегодня
+    cur.execute("SELECT COUNT(*) FROM users WHERE last_task_date = ?", (today,))
+    got_task_today = cur.fetchone()[0]
     conn.close()
-    return {"total": total, "accepted": accepted, "new_today": new_today}
+    return {
+        "total": total,
+        "accepted": accepted,
+        "new_today": new_today,
+        "got_task_today": got_task_today
+    }
 
 # --- РАБОТА С ЗАДАНИЯМИ ---
 def load_messages():
@@ -148,7 +178,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📊 **Статистика бота «Развиваюсь с БСПБ»**\n\n"
         f"👥 Всего пользователей: {stats['total']}\n"
         f"✅ Согласились участвовать: {stats['accepted']}\n"
-        f"🆕 Новых сегодня: {stats['new_today']}\n\n"
+        f"🆕 Новых сегодня: {stats['new_today']}\n"
+        f"📨 Получили задание сегодня: {stats['got_task_today']}\n\n"
         f"📅 Отчёт от: {moscow_time.strftime('%d.%m.%Y %H:%M')}"
     )
     await update.message.reply_text(report, parse_mode='Markdown')
@@ -172,10 +203,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await query.message.reply_text(instruction)
 
-        # Сразу выдаём первое задание
+        # Выдаём первое задание
         task = get_random_task()
         if task:
             await query.message.reply_text(task)
+            # Записываем сегодняшнюю дату выдачи
+            set_last_task_date(user_id, datetime.now().strftime("%Y-%m-%d"))
         else:
             await query.message.reply_text("⚠️ Задания временно недоступны. Попробуйте позже.")
     elif data == "no":
@@ -183,19 +216,30 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Любое текстовое сообщение → выдать случайное задание (если пользователь согласился)."""
+    """Любое текстовое сообщение → выдать задание, если сегодня ещё не получал."""
     user_id = update.effective_user.id
 
-    # Проверяем, давал ли пользователь согласие (было нажато «Да»)
+    # Проверяем, давал ли пользователь согласие
     if not is_accepted(user_id):
         await update.message.reply_text(
             "Чтобы получить задание, сначала нажмите /start и согласитесь на участие в челлендже."
         )
         return
 
+    # Проверяем, не получал ли уже задание сегодня
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    last_date = get_last_task_date(user_id)
+    if last_date == today_str:
+        await update.message.reply_text(
+            "Вы уже получили задание сегодня. Приходите завтра за новым заданием!"
+        )
+        return
+
+    # Выдаём новое задание
     task = get_random_task()
     if task:
         await update.message.reply_text(task)
+        set_last_task_date(user_id, today_str)
     else:
         await update.message.reply_text("⚠️ Задания временно недоступны. Попробуйте позже.")
 
@@ -208,7 +252,7 @@ def main():
         print("Создайте его и добавьте задания (каждое отделяйте пустой строкой)")
 
     print("🤖 Бот «Развиваюсь с БСПБ» запущен...")
-    print("📩 Отправьте любое сообщение, чтобы получить случайное задание.")
+    print("📩 Отправьте любое сообщение, чтобы получить случайное задание (не более 1 в день).")
 
     application = Application.builder().token(TOKEN).build()
 
