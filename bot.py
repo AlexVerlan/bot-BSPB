@@ -42,7 +42,7 @@ def init_db():
     try:
         cur.execute("ALTER TABLE users ADD COLUMN last_task_date TEXT")
     except sqlite3.OperationalError:
-        pass  # столбец уже существует
+        pass
     conn.commit()
     conn.close()
     logger.info("База данных инициализирована.")
@@ -60,8 +60,17 @@ def add_user(user_id, username, first_name):
     conn.commit()
     conn.close()
 
+def get_user_record(user_id):
+    """Возвращает (has_accepted, last_task_date) или None, если пользователя нет."""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT has_accepted, last_task_date FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
 def set_accepted(user_id):
-    """Помечает, что пользователь согласился участвовать."""
+    """Помечает, что пользователь согласился участвовать (только если ещё не соглашался)."""
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("""
@@ -109,7 +118,6 @@ def get_statistics():
     today = datetime.now().strftime("%Y-%m-%d")
     cur.execute("SELECT COUNT(*) FROM users WHERE joined_date LIKE ?", (f"{today}%",))
     new_today = cur.fetchone()[0]
-    # Сколько пользователей получили задание сегодня
     cur.execute("SELECT COUNT(*) FROM users WHERE last_task_date = ?", (today,))
     got_task_today = cur.fetchone()[0]
     conn.close()
@@ -143,27 +151,50 @@ def get_random_task():
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Приветствие и предложение участвовать."""
+    """Приветствие и предложение участвовать (только для новых пользователей)."""
     user = update.effective_user
     user_id = user.id
     username = user.username or "нет username"
     first_name = user.first_name or ""
 
-    add_user(user_id, username, first_name)
+    # Проверяем, существует ли пользователь в базе
+    record = get_user_record(user_id)
 
-    welcome = (
-        f"Привет, {first_name}!\n\n"
-        "Этот бот создан, чтобы поближе познакомить тебя с корпоративной ценностью "
-        "«Развиваю Банк и развиваюсь сам».\n"
-        "Следуя ей, мы развиваем свои навыки, используем в работе лучшие практики, "
-        "постоянно совершенствуемся и помогаем развиваться коллегам, делясь экспертизой.\n\n"
-        "Хочешь принять участие в челлендже «Слепой спринт»?"
-    )
-    keyboard = [
-        [InlineKeyboardButton("✅ Да", callback_data="yes"),
-         InlineKeyboardButton("❌ Нет", callback_data="no")]
-    ]
-    await update.message.reply_text(welcome, reply_markup=InlineKeyboardMarkup(keyboard))
+    if record is None:
+        # Новый пользователь – регистрируем и показываем полное приветствие
+        add_user(user_id, username, first_name)
+        welcome = (
+            f"Привет, {first_name}!\n\n"
+            "Этот бот создан, чтобы поближе познакомить тебя с корпоративной ценностью "
+            "«Развиваю Банк и развиваюсь сам».\n"
+            "Следуя ей, мы развиваем свои навыки, используем в работе лучшие практики, "
+            "постоянно совершенствуемся и помогаем развиваться коллегам, делясь экспертизой.\n\n"
+            "Хочешь принять участие в челлендже «Слепой спринт»?"
+        )
+        keyboard = [
+            [InlineKeyboardButton("✅ Да", callback_data="yes"),
+             InlineKeyboardButton("❌ Нет", callback_data="no")]
+        ]
+        await update.message.reply_text(welcome, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        # Пользователь уже есть в базе
+        has_accepted, _ = record
+        if has_accepted:
+            await update.message.reply_text(
+                "Вы уже участвуете в челлендже «Слепой спринт».\n"
+                "Отправьте любое сообщение, чтобы получить задание "
+                "(если ещё не получали сегодня)."
+            )
+        else:
+            # Ещё не подтвердил участие – даём шанс согласиться, но без приветствия
+            await update.message.reply_text(
+                "Вы уже зарегистрированы, но ещё не подтвердили участие в челлендже.\n"
+                "Хотите принять участие сейчас?",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Да", callback_data="yes"),
+                    InlineKeyboardButton("❌ Нет", callback_data="no")
+                ]])
+            )
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Статистика (только для админов)."""
@@ -193,6 +224,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == "yes":
+        # Если пользователь уже подтверждал участие – не даём задание повторно
+        if is_accepted(user_id):
+            await query.message.reply_text(
+                "Вы уже участвуете в челлендже. Отправьте любое сообщение, чтобы получить задание."
+            )
+            return
+
         set_accepted(user_id)
         instruction = (
             "Я отправлю тебе задание, которое поможет познакомиться с ценностью на практике. "
@@ -203,11 +241,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await query.message.reply_text(instruction)
 
-        # Выдаём первое задание
         task = get_random_task()
         if task:
             await query.message.reply_text(task)
-            # Записываем сегодняшнюю дату выдачи
             set_last_task_date(user_id, datetime.now().strftime("%Y-%m-%d"))
         else:
             await query.message.reply_text("⚠️ Задания временно недоступны. Попробуйте позже.")
@@ -219,14 +255,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Любое текстовое сообщение → выдать задание, если сегодня ещё не получал."""
     user_id = update.effective_user.id
 
-    # Проверяем, давал ли пользователь согласие
     if not is_accepted(user_id):
         await update.message.reply_text(
             "Чтобы получить задание, сначала нажмите /start и согласитесь на участие в челлендже."
         )
         return
 
-    # Проверяем, не получал ли уже задание сегодня
     today_str = datetime.now().strftime("%Y-%m-%d")
     last_date = get_last_task_date(user_id)
     if last_date == today_str:
@@ -235,7 +269,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Выдаём новое задание
     task = get_random_task()
     if task:
         await update.message.reply_text(task)
