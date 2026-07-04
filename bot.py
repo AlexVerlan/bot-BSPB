@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 
-# --- НАСТРОЙКА ---
+# --- НАСТРОЙКА1 ---
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 MESSAGES_FILE = "messages.txt"
