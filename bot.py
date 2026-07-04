@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 
 # --- НАСТРОЙКИ ---
@@ -149,6 +149,12 @@ def get_random_task():
         return None
     return random.choice(tasks)
 
+# --- КЛАВИАТУРЫ ---
+def get_task_keyboard():
+    """Создаёт постоянную клавиатуру с кнопкой получения задания."""
+    keyboard = [[KeyboardButton("🎯 Получить задание")]]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Приветствие и предложение участвовать (только для новых пользователей)."""
@@ -182,8 +188,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if has_accepted:
             await update.message.reply_text(
                 "Вы уже участвуете в челлендже «Слепой спринт».\n"
-                "Отправьте любое сообщение, чтобы получить задание "
-                "(если ещё не получали сегодня)."
+                "Отправьте любое сообщение или нажмите кнопку ниже, чтобы получить задание "
+                "(если ещё не получали сегодня).",
+                reply_markup=get_task_keyboard()
             )
         else:
             # Ещё не подтвердил участие – даём шанс согласиться, но без приветствия
@@ -227,7 +234,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Если пользователь уже подтверждал участие – не даём задание повторно
         if is_accepted(user_id):
             await query.message.reply_text(
-                "Вы уже участвуете в челлендже. Отправьте любое сообщение, чтобы получить задание."
+                "Вы уже участвуете в челлендже. Отправьте любое сообщение или нажмите кнопку ниже, чтобы получить задание.",
+                reply_markup=get_task_keyboard()
             )
             return
 
@@ -245,8 +253,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if task:
             await query.message.reply_text(task)
             set_last_task_date(user_id, datetime.now().strftime("%Y-%m-%d"))
+            # Показываем постоянную кнопку для получения следующих заданий
+            await query.message.reply_text(
+                "👇 Чтобы получить новое задание (доступно раз в день), нажмите кнопку ниже:",
+                reply_markup=get_task_keyboard()
+            )
         else:
-            await query.message.reply_text("⚠️ Задания временно недоступны. Попробуйте позже.")
+            await query.message.reply_text(
+                "⚠️ Задания временно недоступны. Попробуйте позже.",
+                reply_markup=get_task_keyboard()
+            )
     elif data == "no":
         await query.message.reply_text("Жаль. Если передумаешь, просто напиши мне или нажми /start.")
 
@@ -265,7 +281,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_date = get_last_task_date(user_id)
     if last_date == today_str:
         await update.message.reply_text(
-            "Вы уже получили задание сегодня. Приходите завтра за новым заданием!"
+            "Вы уже получили задание сегодня. Приходите завтра за новым заданием!",
+            reply_markup=get_task_keyboard()
         )
         return
 
@@ -273,8 +290,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if task:
         await update.message.reply_text(task)
         set_last_task_date(user_id, today_str)
+        # Клавиатура уже должна быть, но на всякий случай обновим
+        await update.message.reply_text(
+            "Задание выдано! Следующее будет доступно завтра.",
+            reply_markup=get_task_keyboard()
+        )
     else:
-        await update.message.reply_text("⚠️ Задания временно недоступны. Попробуйте позже.")
+        await update.message.reply_text(
+            "⚠️ Задания временно недоступны. Попробуйте позже.",
+            reply_markup=get_task_keyboard()
+        )
 
 # --- ГЛАВНАЯ ФУНКЦИЯ ---
 def main():
@@ -285,7 +310,7 @@ def main():
         print("Создайте его и добавьте задания (каждое отделяйте пустой строкой)")
 
     print("🤖 Бот «Развиваюсь с БСПБ» запущен...")
-    print("📩 Отправьте любое сообщение, чтобы получить случайное задание (не более 1 в день).")
+    print("📩 Отправьте любое сообщение или нажмите кнопку, чтобы получить задание (не более 1 в день).")
 
     application = Application.builder().token(TOKEN).build()
 
