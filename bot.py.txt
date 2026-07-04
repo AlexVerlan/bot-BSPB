@@ -1,0 +1,494 @@
+import os
+import sqlite3
+import random
+import logging
+import sys
+from datetime import datetime, timedelta
+
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardRemove
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
+
+# --- НАСТРОЙКА ---
+load_dotenv()
+TOKEN = os.getenv("BOT_TOKEN")
+MESSAGES_FILE = "messages.txt"
+DB_FILE = "users.db"
+
+# ID администратора (кто может смотреть статистику)
+# Замените на ваш Telegram ID. Узнать свой ID можно у @userinfobot
+ADMIN_IDS = [1030669850]  # ВАЖНО: замените на свой ID!
+
+# Настройка логирования
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# --- РАБОТА С БАЗОЙ ДАННЫХ ---
+def init_db():
+    """Создаёт таблицу пользователей, если её нет."""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            joined_date TEXT,
+            sent_messages TEXT DEFAULT '',
+            is_active INTEGER DEFAULT 1
+        )
+    """)
+    conn.commit()
+    conn.close()
+    logger.info("База данных инициализирована.")
+
+def get_user(user_id):
+    """Возвращает запись пользователя из БД или None."""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT sent_messages, is_active FROM users WHERE user_id = ?", (user_id,))
+    result = cur.fetchone()
+    conn.close()
+    return result
+
+def add_user(user_id, username, first_name):
+    """Добавляет нового пользователя с датой регистрации."""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    # INSERT OR IGNORE - не перезаписывает существующего пользователя
+    cur.execute("""
+        INSERT OR IGNORE INTO users (user_id, username, first_name, joined_date, sent_messages, is_active) 
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (user_id, username, first_name, datetime.now().strftime("%Y-%m-%d %H:%M"), "", 1))
+    
+    # Если пользователь уже был, но неактивный - активируем его снова
+    cur.execute("UPDATE users SET is_active = 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    logger.info(f"Новый пользователь: {username} (ID: {user_id})")
+
+def update_user_sent(user_id, message_index):
+    """Добавляет индекс отправленного сообщения в список пользователя."""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT sent_messages FROM users WHERE user_id = ?", (user_id,))
+    result = cur.fetchone()
+    if result:
+        sent = result[0]
+        if sent:
+            sent = sent + f",{message_index}"
+        else:
+            sent = str(message_index)
+        cur.execute("UPDATE users SET sent_messages = ? WHERE user_id = ?", (sent, user_id))
+    conn.commit()
+    conn.close()
+
+def deactivate_user(user_id):
+    """Помечает пользователя как неактивного."""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET is_active = 0 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    logger.info(f"Пользователь {user_id} деактивирован.")
+
+def activate_user(user_id):
+    """Активирует пользователя снова (если он отписался и снова нажал старт)."""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET is_active = 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    logger.info(f"Пользователь {user_id} реактивирован.")
+
+def get_all_active_users():
+    """Возвращает список всех активных пользователей."""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, sent_messages FROM users WHERE is_active = 1")
+    users = cur.fetchall()
+    conn.close()
+    return users
+
+def get_statistics():
+    """Возвращает статистику для админа."""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    
+    # Общее количество пользователей
+    cur.execute("SELECT COUNT(*) FROM users")
+    total_users = cur.fetchone()[0]
+    
+    # Активные пользователи
+    cur.execute("SELECT COUNT(*) FROM users WHERE is_active = 1")
+    active_users = cur.fetchone()[0]
+    
+    # Кто подписался сегодня
+    today = datetime.now().strftime("%Y-%m-%d")
+    cur.execute("SELECT COUNT(*) FROM users WHERE joined_date LIKE ?", (f"{today}%",))
+    joined_today = cur.fetchone()[0]
+    
+    conn.close()
+    
+    return {
+        "total": total_users,
+        "active": active_users,
+        "joined_today": joined_today
+    }
+
+# --- РАБОТА С СООБЩЕНИЯМИ ---
+def load_messages():
+    """Загружает список посланий из файла.
+    Сообщения разделяются пустыми строками."""
+    try:
+        with open(MESSAGES_FILE, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Разделяем по пустым строкам (два или больше переносов строки)
+        raw_messages = content.split('\n\n')
+        
+        # Очищаем каждое сообщение от лишних пробелов по краям
+        messages = []
+        for msg in raw_messages:
+            # Убираем пустые сообщения
+            msg = msg.strip()
+            if msg:
+                messages.append(msg)
+        
+        logger.info(f"Загружено {len(messages)} сообщений (многострочных)")
+        return messages
+    except FileNotFoundError:
+        logger.error(f"Файл {MESSAGES_FILE} не найден!")
+        return []
+
+def get_random_unused_message(sent_indices_str, all_messages):
+    """
+    Выбирает случайное сообщение, индекс которого еще не использован.
+    Возвращает (текст_сообщения, индекс) или (None, None), если все использованы.
+    """
+    if not all_messages:
+        return None, None
+    
+    # Преобразуем строку "1,5,13" в множество чисел {1,5,13}
+    sent_indices = set()
+    if sent_indices_str:
+        sent_indices = set(map(int, sent_indices_str.split(',')))
+
+    all_indices = set(range(len(all_messages)))
+    available_indices = list(all_indices - sent_indices)
+
+    if not available_indices:
+        return None, None
+
+    chosen_index = random.choice(available_indices)
+    return all_messages[chosen_index], chosen_index
+
+# --- КЛАВИАТУРЫ ---
+def get_start_keyboard():
+    """Создает клавиатуру с большой кнопкой START."""
+    keyboard = [
+        [KeyboardButton("СТАРТ / НАЧАТЬ")]
+    ]
+    resize_keyboard=True
+    """ - кнопка будет маленькой и аккуратной"""
+    # one_time_keyboard=False - кнопка останется после нажатия
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+
+def get_main_menu_keyboard(user_id):
+    """Создает меню с действиями (отписка)."""
+    keyboard = [
+        [InlineKeyboardButton("❌ Отписаться от рассылки", callback_data="stop")],
+    ]
+    
+    
+    return InlineKeyboardMarkup(keyboard)
+
+# --- ОБРАБОТЧИКИ КОМАНД ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start - срабатывает только 1 раз."""
+    user = update.effective_user
+    user_id = user.id
+    username = user.username or "нет username"
+    first_name = user.first_name or ""
+
+    logger.info(f"Попытка использования /start от {username}")
+
+    # Проверяем, есть ли пользователь в БД
+    user_data = get_user(user_id)
+    
+    # ЕСЛИ ПОЛЬЗОВАТЕЛЬ УЖЕ ЕСТЬ В БД
+    if user_data:
+        logger.info(f"Пользователь {username} уже активирован")
+        #Проверяет, активен ли пользователь. Возвращает True если активен, False если неактивен или не найден.""
+        sent_messages, is_active = user_data
+
+        if is_active == 1:
+            logger.info(f"Пользователь {username} уже активирован и не дезактивирован, игнор /start")
+            # Отправляем сообщение, что команда больше не работает если пользователь активен
+            await update.message.reply_text(
+                "❌ **Команда /start больше не доступна!**\n\n"
+                "✅ Вы уже активировали бота ранее.\n"
+                "🔽 Используйте кнопки ниже для управления:",
+                reply_markup=get_main_menu_keyboard(user_id),
+                parse_mode='Markdown'
+            )
+        else:
+            # реактивируем пользователя и отправляем сообщение со статусом
+            logger.info(f"Пользователь {username} реактивирован")
+            activate_user(user_id)
+            await update.message.reply_text(
+                "✅ Вы заново подписались на рассылку."
+                reply_markup=ReplyKeyboardRemove()
+            )
+            await update.message.reply_text(
+                "🔽 Используйте кнопки ниже для управления:",
+                reply_markup=get_main_menu_keyboard(user_id),
+                parse_mode='Markdown'
+            )
+
+
+        return  # Выходим из функции, не выполняя дальнейший код
+
+    # ЕСЛИ ПОЛЬЗОВАТЕЛЬ НОВЫЙ (первый запуск)
+    logger.info(f"Новый пользователь {username}, выполняем первый запуск")
+    
+    # Регистрируем нового пользователя
+    add_user(user_id, username, first_name)
+    
+    # Загружаем сообщения
+    all_messages = load_messages()
+    if not all_messages:
+        await update.message.reply_text("⚠️ Ошибка: файл с посланиями не найден. Сообщите администратору.")
+        return
+
+    # Приветственное сообщение для нового пользователя
+    welcome_text = (
+        f"👋 **Привет, {first_name}!**\n\n"
+        "Этот бот создан, чтобы поближе познакомить тебя с корпоративной ценностью «Развиваю Банк и развиваюсь сам».\n"
+        "Следуя ей, мы развиваем свои навыки, используем в работе лучшие практики, постоянно совершентсвуемся и помогаем развиваться коллегам, делясь экспертизой.\n\n"
+        "Хочешь принять участие в челлендже «Слепой спринт?»"
+    )
+    
+    await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    
+    # Отправляем первое сообщение
+    message_text, msg_index = get_random_unused_message("", all_messages)
+    
+    await update.message.reply_text(message_text)
+    update_user_sent(user_id, msg_index)
+    logger.info(f"Первое сообщение (индекс {msg_index}) отправлено новому пользователю {user_id}")
+        
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает нажатие на кнопку START."""
+    text = update.message.text
+    user_id = update.effective_user.id
+    
+    if text == "СТАРТ / НАЧАТЬ":
+        # Если нажали кнопку START - запускаем команду /start
+        # Создаем контекст как для команды /start
+        await start(update, context)
+    else:
+        # На любое другое сообщение напоминаем про кнопку
+        await update.message.reply_text(
+            "❓Я всего лишь бот, не могу понять что вы написали..\n"
+             reply_markup=get_main_menu_keyboard(user_id),
+            parse_mode='Markdown'
+        )
+#########################################################################
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /stop."""
+    user_id = update.effective_user.id
+    
+    deactivate_user(user_id)
+    
+    await update.message.reply_text(
+        "✅ Вы отписались от рассылки. Послания больше не будут приходить.\n"
+        "Если передумаете — просто нажмите кнопку СТАРТ!",
+        reply_markup=get_start_keyboard()
+    )
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /stats (только для админа)."""
+    user_id = update.effective_user.id
+    
+    # Проверяем, админ ли это
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ У вас нет прав для просмотра статистики.")
+        return
+    
+    # Получаем общую статистику
+    stats = get_statistics()
+    all_messages = load_messages()
+    total_messages = len(all_messages)
+    
+    # Получаем детальную информацию по каждому пользователю
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    
+    # Все пользователи с их отправленными сообщениями
+    cur.execute("SELECT user_id, username, first_name, sent_messages, is_active FROM users")
+    all_users = cur.fetchall()
+    
+    # Статистика по сообщениям
+    total_sent_all = 0  # Всего отправлено сообщений (суммарно)
+    users_with_all_messages = 0  # Пользователи, получившие все сообщения
+    users_with_none = 0  # Пользователи, не получившие ни одного
+    
+    user_stats = []
+    for db_user in all_users:
+        uid, uname, fname, sent_str, active = db_user
+        
+        if sent_str:
+            sent_count = len(sent_str.split(','))
+            if sent_count >= total_messages:
+                users_with_all_messages += 1
+        else:
+            sent_count = 0
+            users_with_none += 1
+            
+        total_sent_all += sent_count
+        
+        # Для отладки (можно убрать)
+        user_stats.append(f"{fname or uname or uid}: {sent_count}/{total_messages}")
+    
+    conn.close()
+    
+    # Среднее количество сообщений на пользователя
+    avg_sent = round(total_sent_all / stats['total'], 1) if stats['total'] > 0 else 0
+    
+    # Оставшиеся сообщения (приблизительно)
+    # Каждому активному пользователю в среднем осталось получить
+    remaining_per_user = total_messages - (total_sent_all / stats['active']) if stats['active'] > 0 else 0
+    remaining_per_user = round(remaining_per_user, 1)
+    
+    # Формируем отчет
+    report = (
+        "📊 **СТАТИСТИКА БОТА**\n\n"
+        f"👥 **Пользователи:**\n"
+        f"• Всего в базе: {stats['total']}\n"
+        f"• Активных сейчас: {stats['active']}\n"
+        f"• Новых сегодня: {stats['joined_today']}\n\n"
+        f"📨 **Сообщения (всего {total_messages}):**\n"
+        f"• Отправлено всего: {total_sent_all}\n"
+        f"• В среднем на пользователя: {avg_sent} шт.\n"
+        f"• Получили все сообщения: {users_with_all_messages} чел.\n"
+        f"• Еще не получали: {users_with_none} чел.\n\n"
+        f"📅 **Прогноз:**\n"
+        f"• Активным осталось ~{remaining_per_user} сообщений в среднем\n"
+        f"• Всего осталось отправить: ~{int(remaining_per_user * stats['active'])}\n\n"
+        f"📋 **Детали:**\n"
+    )
+    
+    # Добавляем детали по первым 5 пользователям (для примера)
+    for detail in user_stats[:5]:
+        report += f"  {detail}\n"
+    
+    if len(user_stats) > 5:
+        report += f"  ... и еще {len(user_stats) - 5}\n"
+    
+    moscow_time = datetime.now() + timedelta(hours=3)
+
+    report += f"\n📅 **Отчет от:** {moscow_time.strftime('%d.%m.%Y %H:%M')}"
+    
+    await update.message.reply_text(report, parse_mode='Markdown')
+    
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатий на инлайн-кнопки."""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    
+    if query.data == "stop":
+        deactivate_user(user_id)
+        await query.message.reply_text(
+            text="✅ Вы отписались от рассылки. Послания больше не будут приходить.\n"
+                 "Если передумаете — просто нажмите кнопку СТАРТ!",
+            reply_markup=get_start_keyboard()
+        )
+
+
+async def send_daily_messages():
+    """Функция для ежедневной рассылки."""
+    logger.info("Запуск ежедневной рассылки...")
+    
+    all_messages = load_messages()
+    if not all_messages:
+        logger.error("Нет сообщений для рассылки!")
+        return
+        
+    active_users = get_all_active_users()
+
+    if not active_users:
+        logger.info("Нет активных пользователей для рассылки.")
+        return
+
+    # Создаём приложение для отправки сообщений
+    application = Application.builder().token(TOKEN).build()
+
+    for user_id, sent_messages_str in active_users:
+        message_text, msg_index = get_random_unused_message(sent_messages_str, all_messages)
+
+        if message_text:
+            try:
+                await application.bot.send_message(chat_id=user_id, text=message_text)
+                update_user_sent(user_id, msg_index)
+                logger.info(f"Ежедневное сообщение (индекс {msg_index}) отправлено пользователю {user_id}")
+                
+                # Небольшая задержка между сообщениями
+                import asyncio
+                await asyncio.sleep(0.05)
+                
+            except Exception as e:
+                logger.error(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
+                # Если бот заблокирован - деактивируем
+                if "Forbidden" in str(e):
+                    deactivate_user(user_id)
+        else:
+            logger.info(f"Для пользователя {user_id} сообщения кончились. Деактивируем.")
+            deactivate_user(user_id)
+
+    logger.info("Ежедневная рассылка завершена.")
+    await application.shutdown()
+
+# --- ГЛАВНАЯ ФУНКЦИЯ ---
+def main():
+    """Точка входа."""
+    # Инициализируем БД
+    init_db()
+
+    # Проверяем наличие файла с сообщениями
+    if not os.path.exists(MESSAGES_FILE):
+        print(f"⚠️ ВНИМАНИЕ: Файл {MESSAGES_FILE} не найден!")
+        print(f"Создайте его и добавьте послания (каждое сообщение отделяйте пустой строкой)")
+
+    # Проверяем режим запуска
+    if "--daily" in sys.argv:
+        # Режим рассылки
+        import asyncio
+        asyncio.run(send_daily_messages())
+    else:
+        # Обычный режим
+        print("🤖 Бот запущен в режиме ожидания...")
+        print("🔘 Кнопка START будет показана всем пользователям")
+        print(f"📊 Статистика доступна по команде /stats (только для админов)")
+        print(f"🛑 Отписка по команде /stop или кнопке")
+        
+        application = Application.builder().token(TOKEN).build()
+        
+        # Добавляем обработчики
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("stop", stop_command))
+        application.add_handler(CommandHandler("stats", stats_command))
+        application.add_handler(CallbackQueryHandler(button_callback))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        
+        application.run_polling()
+
+if __name__ == "__main__":
+    main()
